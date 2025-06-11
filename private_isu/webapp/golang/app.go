@@ -736,6 +736,10 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
     }
     defer savedFile.Close()
 
+	if err := os.Chmod(filePath, 0644); err != nil {
+		log.Printf("chmod error: %v", err)
+	}
+
     _, err = io.Copy(savedFile, file)
     if err != nil {
         log.Print(err)
