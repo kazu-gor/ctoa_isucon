@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
     "crypto/sha512" // これを追加
     "encoding/hex"   // これを追加
 	"html/template"
@@ -247,7 +248,7 @@ func getCSRFToken(r *http.Request) string {
 
 func secureRandomStr(b int) string {
 	k := make([]byte, b)
-	if _, err := crand.Read(k); err != nil {
+	if _, err := rand.Read(k); err != nil {
 		panic(err)
 	}
 	return fmt.Sprintf("%x", k)
