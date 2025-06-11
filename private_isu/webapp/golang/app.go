@@ -465,18 +465,32 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	results := []Post{}
+	// Try to get posts from cache first
+	cacheKey := "index_posts"
+	posts, cached := getPostsFromCache(cacheKey)
+	
+	if !cached {
+		results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
-	if err != nil {
-		log.Print(err)
-		return
-	}
+		err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage*2)
+		if err != nil {
+			log.Print(err)
+			return
+		}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
+		posts, err = makePosts(results, getCSRFToken(r), false)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		
+		// Cache the processed posts
+		setPostsToCache(cacheKey, posts)
+	} else {
+		// Update CSRF tokens for cached posts
+		for i := range posts {
+			posts[i].CSRFToken = getCSRFToken(r)
+		}
 	}
 
 	fmap := template.FuncMap{
@@ -513,7 +527,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage*2)
 	if err != nil {
 		log.Print(err)
 		return
@@ -601,7 +615,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage*2)
 	if err != nil {
 		log.Print(err)
 		return
@@ -747,6 +761,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
+
+	// Invalidate cache when new post is created
+	memcacheClient.Delete("index_posts")
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
@@ -936,6 +953,35 @@ func main() {
 
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
+// Post caching functions
+func getPostsFromCache(key string) ([]Post, bool) {
+	item, err := memcacheClient.Get(key)
+	if err != nil {
+		return nil, false
+	}
+
+	var posts []Post
+	err = json.Unmarshal(item.Value, &posts)
+	if err != nil {
+		return nil, false
+	}
+
+	return posts, true
+}
+
+func setPostsToCache(key string, posts []Post) {
+	value, err := json.Marshal(posts)
+	if err != nil {
+		return
+	}
+
+	memcacheClient.Set(&memcache.Item{
+		Key:        key,
+		Value:      value,
+		Expiration: 60, // 1 minute
+	})
+}
+
 // User caching functions
 func getUserFromCache(userID int) (User, bool) {
 	key := fmt.Sprintf("user:%d", userID)
