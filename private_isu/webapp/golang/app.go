@@ -2,6 +2,8 @@ package main
 
 import (
 	crand "crypto/rand"
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io"
@@ -9,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
@@ -112,22 +113,10 @@ func validateUser(accountName, password string) bool {
 		regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`).MatchString(password)
 }
 
-// 今回のGo実装では言語側のエスケープの仕組みが使えないのでOSコマンドインジェクション対策できない
-// 取り急ぎPHPのescapeshellarg関数を参考に自前で実装
-// cf: http://jp2.php.net/manual/ja/function.escapeshellarg.php
-func escapeshellarg(arg string) string {
-	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
-}
-
 func digest(src string) string {
-	// opensslのバージョンによっては (stdin)= というのがつくので取る
-	out, err := exec.Command("/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
-	if err != nil {
-		log.Print(err)
-		return ""
-	}
-
-	return strings.TrimSuffix(string(out), "\n")
+	h := sha512.New()
+	h.Write([]byte(src))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func calculateSalt(accountName string) string {
@@ -546,29 +535,16 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
+	postCount := 0
+	err = db.Get(&postCount, "SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-	postCount := len(postIDs)
 
 	commentedCount := 0
 	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
+		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` c JOIN `posts` p ON c.post_id = p.id WHERE p.user_id = ?", user.ID)
 		if err != nil {
 			log.Print(err)
 			return
@@ -825,6 +801,9 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Invalidate cache when new comment is added
+	memcacheClient.Delete("index_posts")
+
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
@@ -929,6 +908,11 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	// Configure connection pool
+	db.SetMaxOpenConns(100)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(time.Minute * 3)
 
 	r := chi.NewRouter()
 
