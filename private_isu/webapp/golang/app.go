@@ -145,6 +145,7 @@ func getSessionUser(r *http.Request) User {
 	session := getSession(r)
 	uid, ok := session.Values["user_id"]
 	if !ok || uid == nil {
+		log.Printf("getSessionUser: FAILED. user_id not found in session. Session values: %+v", session.Values)
 		return User{}
 	}
 
@@ -152,6 +153,7 @@ func getSessionUser(r *http.Request) User {
 
 	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
 	if err != nil {
+		log.Printf("getSessionUser: FAILED. db.Get failed for uid %v: %v", uid, err)
 		return User{}
 	}
 
