@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"encoding/json"
+
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
 	"github.com/go-chi/chi/v5"
@@ -25,8 +27,9 @@ import (
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	db          *sqlx.DB
+	store       *gsm.MemcacheStore
+	memcacheClient *memcache.Client
 )
 
 const (
@@ -71,7 +74,7 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
+	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -174,39 +177,116 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
+	if len(results) == 0 {
+		return posts, nil
+	}
+
+	// Collect all post IDs and user IDs
+	postIDs := make([]int, 0, len(results))
+	userIDs := make(map[int]bool)
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		postIDs = append(postIDs, p.ID)
+		userIDs[p.UserID] = true
+	}
+
+	// Batch load comment counts
+	type CommentCount struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	var commentCounts []CommentCount
+	query, args, err := sqlx.In("SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN (?) GROUP BY post_id", postIDs)
+	if err != nil {
+		return nil, err
+	}
+	err = db.Select(&commentCounts, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	commentCountMap := make(map[int]int)
+	for _, cc := range commentCounts {
+		commentCountMap[cc.PostID] = cc.Count
+	}
+
+	// Batch load comments with proper ordering and limiting
+	var allCommentsList []Comment
+	if allComments {
+		// Load all comments for each post
+		commentQuery := "SELECT * FROM comments WHERE post_id IN (?) ORDER BY post_id, created_at DESC"
+		query, args, err = sqlx.In(commentQuery, postIDs)
 		if err != nil {
 			return nil, err
 		}
-
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+		err = db.Select(&allCommentsList, query, args...)
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		// Use window function to get top 3 comments per post in single query
+		commentQuery := `
+			SELECT id, post_id, user_id, comment, created_at FROM (
+				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
+				FROM comments 
+				WHERE post_id IN (?)
+			) ranked_comments 
+			WHERE rn <= 3
+			ORDER BY post_id, created_at DESC
+		`
+		query, args, err = sqlx.In(commentQuery, postIDs)
+		if err != nil {
+			return nil, err
+		}
+		err = db.Select(&allCommentsList, query, args...)
+		if err != nil {
+			return nil, err
+		}
+	}
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+	// Group comments by post_id and collect comment user IDs
+	commentsMap := make(map[int][]Comment)
+	for _, c := range allCommentsList {
+		commentsMap[c.PostID] = append(commentsMap[c.PostID], c)
+		userIDs[c.UserID] = true
+	}
+
+	// Convert userIDs map to slice
+	userIDSlice := make([]int, 0, len(userIDs))
+	for uid := range userIDs {
+		userIDSlice = append(userIDSlice, uid)
+	}
+
+	// Batch load all users with cache
+	userMap, err := getUsersWithCache(userIDSlice)
+	if err != nil {
+		return nil, err
+	}
+
+	// Assemble posts with all data
+	for _, p := range results {
+		// Set comment count
+		p.CommentCount = commentCountMap[p.ID]
+
+		// Set comments
+		if comments, ok := commentsMap[p.ID]; ok {
+			// Add users to comments
+			for i := range comments {
+				if user, ok := userMap[comments[i].UserID]; ok {
+					comments[i].User = user
+				}
 			}
+			// Comments are already in DESC order from SQL, but we need to reverse for display
+			// (original code expected oldest first for display)
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
+			p.Comments = comments
+		} else {
+			p.Comments = []Comment{}
 		}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
+		// Set user
+		if user, ok := userMap[p.UserID]; ok {
+			p.User = user
 		}
 
 		p.CSRFToken = csrfToken
@@ -214,6 +294,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		if p.User.DelFlg == 0 {
 			posts = append(posts, p)
 		}
+
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -854,4 +935,69 @@ func main() {
 	})
 
 	log.Fatal(http.ListenAndServe(":8080", r))
+}
+// User caching functions
+func getUserFromCache(userID int) (User, bool) {
+	key := fmt.Sprintf("user:%d", userID)
+	item, err := memcacheClient.Get(key)
+	if err != nil {
+		return User{}, false
+	}
+
+	var user User
+	err = json.Unmarshal(item.Value, &user)
+	if err != nil {
+		return User{}, false
+	}
+
+	return user, true
+}
+
+func setUserToCache(user User) {
+	key := fmt.Sprintf("user:%d", user.ID)
+	value, err := json.Marshal(user)
+	if err != nil {
+		return
+	}
+
+	memcacheClient.Set(&memcache.Item{
+		Key:        key,
+		Value:      value,
+		Expiration: 300, // 5 minutes
+	})
+}
+
+func getUsersWithCache(userIDs []int) (map[int]User, error) {
+	userMap := make(map[int]User)
+	missedUserIDs := []int{}
+
+	// Try to get from cache first
+	for _, userID := range userIDs {
+		if user, found := getUserFromCache(userID); found {
+			userMap[userID] = user
+		} else {
+			missedUserIDs = append(missedUserIDs, userID)
+		}
+	}
+
+	// Batch load missed users from database
+	if len(missedUserIDs) > 0 {
+		var users []User
+		query, args, err := sqlx.In("SELECT * FROM users WHERE id IN (?)", missedUserIDs)
+		if err != nil {
+			return nil, err
+		}
+		err = db.Select(&users, query, args...)
+		if err != nil {
+			return nil, err
+		}
+
+		// Add to cache and map
+		for _, user := range users {
+			userMap[user.ID] = user
+			setUserToCache(user)
+		}
+	}
+
+	return userMap, nil
 }
