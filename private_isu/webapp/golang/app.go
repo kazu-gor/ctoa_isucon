@@ -518,7 +518,8 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `filename`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage*2)
+	// 正しいクエリ: user.ID で投稿を検索する
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `filename`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -553,7 +554,6 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		}
 		placeholder := strings.Join(s, ", ")
 
-		// convert []int -> []interface{}
 		args := make([]interface{}, len(postIDs))
 		for i, v := range postIDs {
 			args[i] = v
@@ -606,7 +606,8 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `filename`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage*2)
+	// 正しいクエリ: 時刻 t で投稿を検索する
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `filename`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
