@@ -53,6 +53,7 @@ type Post struct {
 	FileName     string    `db:"filename"`
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
+	Imgdata      []byte    `db:"imgdata"`
 	CreatedAt    time.Time `db:"created_at"`
 	CommentCount int
 	Comments     []Comment
@@ -304,7 +305,60 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 }
 
 func imageURL(p Post) string {
-    return "/image/" + p.FileName
+    if p.FileName != "" { // 新しい投稿 (ファイルに保存)
+        return "/image/" + p.FileName
+    }
+    // 古い投稿 (DBに保存) - Goアプリが配信するパス
+    ext := ""
+    if strings.Contains(p.Mime, "jpeg") { ext = "jpg" }
+    if strings.Contains(p.Mime, "png")  { ext = "png" }
+    if strings.Contains(p.Mime, "gif")  { ext = "gif" }
+    // mimeが不正な場合などのフォールバック
+    if ext == "" {
+         return "/noimage.jpg" // 適切なデフォルト画像パスやエラー表示に
+    }
+    return fmt.Sprintf("/image_db/%d.%s", p.ID, ext)
+}
+
+// getOldImage はDBに保存されている古い画像を配信します
+func getOldImage(w http.ResponseWriter, r *http.Request) {
+    pidStr := r.PathValue("id")
+    pid, err := strconv.Atoi(pidStr)
+    if err != nil {
+        w.WriteHeader(http.StatusNotFound)
+        return
+    }
+
+    post := Post{} // Imgdataフィールドが追加されたPost構造体を使用
+    // DBからimgdataも含む全てのカラムを取得
+    err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+    if err != nil {
+        log.Print(err)
+        w.WriteHeader(http.StatusNotFound)
+        return
+    }
+
+    // filenameがあればNginxが処理すべき、imgdataがなければ画像が存在しない
+    if post.FileName != "" || len(post.Imgdata) == 0 {
+        w.WriteHeader(http.StatusNotFound)
+        return
+    }
+
+    // URLの拡張子とDBのMIMEタイプをチェックして画像を返す
+    ext := r.PathValue("ext")
+    if (ext == "jpg" || ext == "jpeg") && post.Mime == "image/jpeg" ||
+        ext == "png" && post.Mime == "image/png" ||
+        ext == "gif" && post.Mime == "image/gif" {
+        w.Header().Set("Content-Type", post.Mime)
+        _, err := w.Write(post.Imgdata)
+        if err != nil {
+            log.Print(err)
+            return
+        }
+        return
+    }
+
+    w.WriteHeader(http.StatusNotFound)
 }
 
 func isLogin(u User) bool {
@@ -947,6 +1001,7 @@ func main() {
 	r.Get("/posts", getPosts)
 	r.Get("/posts/{id}", getPostsID)
 	r.Post("/", postIndex)
+	r.Get("/image_db/{id}.{ext}", getOldImage)
 	// r.Get("/image/{id}.{ext}", getImage)
 	r.Post("/comment", postComment)
 	r.Get("/admin/banned", getAdminBanned)
