@@ -3,3 +3,6 @@
 backup/
 go/
 .netrc
+*.zip
+*.tar.gz
+.bash*
