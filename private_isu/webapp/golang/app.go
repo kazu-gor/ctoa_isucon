@@ -305,22 +305,14 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 }
 
 func imageURL(p Post) string {
-    if p.FileName != "" { // 新しい投稿 (ファイルに保存)
-        return "/image/" + p.FileName
-    }
-    // 古い投稿 (DBに保存) - Goアプリが配信するパス
-    ext := ""
-    if strings.Contains(p.Mime, "jpeg") { ext = "jpg" }
-    if strings.Contains(p.Mime, "png")  { ext = "png" }
-    if strings.Contains(p.Mime, "gif")  { ext = "gif" }
-    // mimeが不正な場合などのフォールバック
-    if ext == "" {
-         return "/noimage.jpg" // 適切なデフォルト画像パスやエラー表示に
-    }
-    return fmt.Sprintf("/image_db/%d.%s", p.ID, ext)
+    // 移行処理が完了すれば、全てのPostにはfilenameが設定されているはずなので、
+    // シンプルに/image/ + filename を返す
+    // もし念のためfilenameが空の場合のフォールバックが必要なら、以前の /noimage.jpg などを使う
+    return "/image/" + p.FileName
 }
 
 // getOldImage はDBに保存されている古い画像を配信します
+/*
 func getOldImage(w http.ResponseWriter, r *http.Request) {
     pidStr := r.PathValue("id")
     pid, err := strconv.Atoi(pidStr)
@@ -360,6 +352,7 @@ func getOldImage(w http.ResponseWriter, r *http.Request) {
 
     w.WriteHeader(http.StatusNotFound)
 }
+*/
 
 func isLogin(u User) bool {
 	return u.ID != 0
@@ -989,6 +982,69 @@ func main() {
 	}
 	defer db.Close()
 
+	log.Println("Migrating old images to files...")
+    rows, err := db.Query("SELECT id, mime, imgdata FROM posts WHERE filename = ''")
+    if err != nil {
+        log.Printf("Failed to query old images (this might be normal if all images are migrated): %v", err)
+    } else {
+        defer rows.Close()
+
+        for rows.Next() {
+            var id int
+            var mime string
+            var imgdata []byte
+            if err := rows.Scan(&id, &mime, &imgdata); err != nil {
+                log.Printf("Failed to scan old image: %v", err)
+                continue
+            }
+
+            if len(imgdata) == 0 {
+                log.Printf("No image data found for post ID %d (possibly already migrated or missing).", id)
+                continue // データがない場合はスキップ
+            }
+
+            ext := ""
+            if strings.Contains(mime, "jpeg") { ext = ".jpg" }
+            else if strings.Contains(mime, "png")  { ext = ".png" }
+            else if strings.Contains(mime, "gif")  { ext = ".gif" }
+            
+            if ext == "" {
+                log.Printf("Unknown mime type for post ID %d: %s", id, mime)
+                continue
+            }
+
+            // ファイル名を生成（既存IDを使用すると重複しない）
+            newFileName := fmt.Sprintf("old_%d%s", id, ext)
+            filePath := path.Join("../public/image", newFileName) // 既存の画像ディレクトリに保存
+
+            savedFile, err := os.Create(filePath)
+            if err != nil {
+                log.Printf("Failed to create file for old image %d: %v", id, err)
+                continue
+            }
+            defer savedFile.Close() // ループ内でdeferすると効率が悪いが、確実性のため一旦このままで
+
+            if err := os.Chmod(filePath, 0644); err != nil {
+                log.Printf("chmod error for old image %d: %v", id, err)
+            }
+
+            _, err = savedFile.Write(imgdata)
+            if err != nil {
+                log.Printf("Failed to write old image %d data to file: %v", id, err)
+                continue
+            }
+
+            // DBのfilenameカラムを更新
+            _, err = db.Exec("UPDATE posts SET filename = ?, imgdata = NULL WHERE id = ?", newFileName, id) // imgdataをNULLにする
+            if err != nil {
+                log.Printf("Failed to update filename for old image %d: %v", id, err)
+                continue
+            }
+            log.Printf("Migrated post %d to file: %s", id, newFileName)
+        }
+    }
+    log.Println("Old image migration complete.")
+
 	r := chi.NewRouter()
 
 	r.Get("/initialize", getInitialize)
@@ -1001,15 +1057,15 @@ func main() {
 	r.Get("/posts", getPosts)
 	r.Get("/posts/{id}", getPostsID)
 	r.Post("/", postIndex)
-	r.Get("/image_db/{id}.{ext}", getOldImage)
+	// r.Get("/image_db/{id}.{ext}", getOldImage)
 	// r.Get("/image/{id}.{ext}", getImage)
 	r.Post("/comment", postComment)
 	r.Get("/admin/banned", getAdminBanned)
 	r.Post("/admin/banned", postAdminBanned)
 	r.Get(`/@{accountName:[a-zA-Z]+}`, getAccountName)
-	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-		http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
-	})
+	//r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+	//	http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
+	//})
 
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
