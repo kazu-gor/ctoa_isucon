@@ -50,7 +50,7 @@ type User struct {
 type Post struct {
 	ID           int       `db:"id"`
 	UserID       int       `db:"user_id"`
-	Imgdata      []byte    `db:"imgdata"`
+	FileName     string    `db:"filename"`
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
 	CreatedAt    time.Time `db:"created_at"`
@@ -304,16 +304,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 }
 
 func imageURL(p Post) string {
-	ext := ""
-	if p.Mime == "image/jpeg" {
-		ext = ".jpg"
-	} else if p.Mime == "image/png" {
-		ext = ".png"
-	} else if p.Mime == "image/gif" {
-		ext = ".gif"
-	}
-
-	return "/image/" + strconv.Itoa(p.ID) + ext
+    return "/image/" + p.FileName
 }
 
 func isLogin(u User) bool {
@@ -651,7 +642,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `filename`, `created_at` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -707,6 +698,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
+	defer file.Close()
 
 	mime := ""
 	if file != nil {
@@ -728,27 +720,33 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	filedata, err := io.ReadAll(file)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+	ext := ""
+    if mime == "image/jpeg" { ext = ".jpg" }
+    if mime == "image/png"  { ext = ".png" }
+    if mime == "image/gif"  { ext = ".gif" }
+    fileName := secureRandomStr(16) + ext
+    filePath := path.Join("../public/image", fileName)
 
-	if len(filedata) > UploadLimit {
-		session := getSession(r)
-		session.Values["notice"] = "ファイルサイズが大きすぎます"
-		session.Save(r, w)
+    // ファイルを保存
+    savedFile, err := os.Create(filePath)
+    if err != nil {
+        log.Print(err)
+        return
+    }
+    defer savedFile.Close()
 
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
+    _, err = io.Copy(savedFile, file)
+    if err != nil {
+        log.Print(err)
+        return
+    }
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	query := "INSERT INTO `posts` (`user_id`, `mime`, `filename`, `body`) VALUES (?,?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
 		mime,
-		filedata,
+		fileName,
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -768,6 +766,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
+/*
 func getImage(w http.ResponseWriter, r *http.Request) {
 	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
@@ -799,6 +798,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusNotFound)
 }
+*/
 
 func postComment(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
