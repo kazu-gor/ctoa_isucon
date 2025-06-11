@@ -174,48 +174,174 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
-	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
+	// 投稿IDのスライスを作成
+	postIDs := make([]int, 0, len(results))
+	postIDMap := make(map[int]*Post)
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+	// 最初に全投稿を処理して、必要なIDを集める
+	for i, p := range results {
+		postIDs = append(postIDs, p.ID)
+		results[i].CSRFToken = csrfToken
+		postIDMap[p.ID] = &results[i]
+	}
+
+	// 早期リターンのチェック
+	if len(postIDs) == 0 {
+		return posts, nil
+	}
+
+	// IN句のためのプレースホルダーを作成
+	placeholders := make([]string, len(postIDs))
+	args := make([]interface{}, len(postIDs))
+	for i, id := range postIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	placeholder := strings.Join(placeholders, ",")
+
+	// コメント数を一括で取得
+	commentCountQuery := fmt.Sprintf("SELECT post_id, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (%s) GROUP BY post_id", placeholder)
+	commentCounts := []struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}{}
+	err := db.Select(&commentCounts, commentCountQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// コメント数を投稿に設定
+	for _, cc := range commentCounts {
+		if post, ok := postIDMap[cc.PostID]; ok {
+			post.CommentCount = cc.Count
+		}
+	}
+
+	// コメントを一括で取得
+	var commentsQuery string
+	if !allComments {
+		// 各投稿の最新3件のコメントのみを取得するサブクエリ
+		commentsQuery = fmt.Sprintf(`
+			SELECT c.* FROM comments c
+			INNER JOIN (
+				SELECT post_id, id, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as row_num
+				FROM comments
+				WHERE post_id IN (%s)
+			) ranked
+			ON c.id = ranked.id
+			WHERE ranked.row_num <= 3
+			ORDER BY c.post_id, c.created_at ASC`, placeholder)
+	} else {
+		commentsQuery = fmt.Sprintf(`SELECT * FROM comments WHERE post_id IN (%s) ORDER BY post_id, created_at ASC`, placeholder)
+	}
+
+	comments := []Comment{}
+	err = db.Select(&comments, commentsQuery, args...)
+	if err != nil {
+		// ROW_NUMBER()が使えない古いMySQLバージョンの場合は別の方法を試す
 		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
+			// 代替手段：各投稿ごとに個別にクエリを実行
+			comments = []Comment{}
+			for _, pid := range postIDs {
+				var postComments []Comment
+				query := "SELECT * FROM comments WHERE post_id = ? ORDER BY created_at DESC LIMIT 3"
+				err = db.Select(&postComments, query, pid)
+				if err != nil {
+					return nil, err
+				}
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+				// 古い順に並べ直す
+				for i, j := 0, len(postComments)-1; i < j; i, j = i+1, j-1 {
+					postComments[i], postComments[j] = postComments[j], postComments[i]
+				}
+
+				comments = append(comments, postComments...)
 			}
+		} else {
+			return nil, err
 		}
+	}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+	// コメントを投稿ごとにグループ化
+	commentsByPostID := make(map[int][]Comment)
+
+	for i := range comments {
+		postID := comments[i].PostID
+		if _, ok := commentsByPostID[postID]; !ok {
+			commentsByPostID[postID] = []Comment{}
 		}
+		commentsByPostID[postID] = append(commentsByPostID[postID], comments[i])
+	}
 
-		p.Comments = comments
+	// ユーザーIDを収集
+	userIDs := make(map[int]struct{})
+	for _, p := range results {
+		userIDs[p.UserID] = struct{}{}
+	}
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+	for _, c := range comments {
+		userIDs[c.UserID] = struct{}{}
+	}
+
+	// ユーザーIDのスライスを作成
+	userIDsList := make([]int, 0, len(userIDs))
+	for id := range userIDs {
+		userIDsList = append(userIDsList, id)
+	}
+
+	// ユーザーを一括で取得
+	if len(userIDsList) > 0 {
+		// ユーザープレースホルダーを作成
+		userPlaceholders := make([]string, len(userIDsList))
+		userArgs := make([]interface{}, len(userIDsList))
+		for i, id := range userIDsList {
+			userPlaceholders[i] = "?"
+			userArgs[i] = id
+		}
+		userPlaceholder := strings.Join(userPlaceholders, ",")
+
+		// ユーザー情報を一括で取得
+		users := []User{}
+		userQuery := fmt.Sprintf("SELECT * FROM `users` WHERE `id` IN (%s)", userPlaceholder)
+		err = db.Select(&users, userQuery, userArgs...)
 		if err != nil {
 			return nil, err
 		}
 
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
+		// ユーザーIDとユーザー情報のマッピングを作成
+		userMap := make(map[int]User)
+		for _, user := range users {
+			userMap[user.ID] = user
 		}
-		if len(posts) >= postsPerPage {
-			break
+
+		// 各投稿にコメントとユーザー情報を設定
+		for _, p := range results {
+			// ユーザー情報を設定
+			if user, ok := userMap[p.UserID]; ok {
+				p.User = user
+			}
+
+			// コメントをユーザー情報と共に設定
+			if postComments, ok := commentsByPostID[p.ID]; ok {
+				for i := 0; i < len(postComments); i++ {
+					if user, ok := userMap[postComments[i].UserID]; ok {
+						postComments[i].User = user
+					}
+				}
+
+				// コメントを追加
+				p.Comments = postComments
+			}
+
+			// 削除されていないユーザーの投稿のみ追加
+			if p.User.DelFlg == 0 {
+				posts = append(posts, p)
+			}
+
+			// 規定の数に達したら終了
+			if len(posts) >= postsPerPage {
+				break
+			}
 		}
 	}
 
