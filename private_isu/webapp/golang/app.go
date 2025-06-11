@@ -208,20 +208,41 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		commentCountMap[cc.PostID] = cc.Count
 	}
 
-	// Batch load comments
-	commentQuery := "SELECT * FROM comments WHERE post_id IN (?) ORDER BY post_id, created_at DESC"
-	query, args, err = sqlx.In(commentQuery, postIDs)
-	if err != nil {
-		return nil, err
-	}
+	// Batch load comments with proper ordering and limiting
 	var allCommentsList []Comment
-	err = db.Select(&allCommentsList, query, args...)
-	if err != nil {
-		return nil, err
+	if allComments {
+		// Load all comments for each post
+		commentQuery := "SELECT * FROM comments WHERE post_id IN (?) ORDER BY post_id, created_at DESC"
+		query, args, err = sqlx.In(commentQuery, postIDs)
+		if err != nil {
+			return nil, err
+		}
+		err = db.Select(&allCommentsList, query, args...)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Use window function to get top 3 comments per post in single query
+		commentQuery := `
+			SELECT id, post_id, user_id, comment, created_at FROM (
+				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
+				FROM comments 
+				WHERE post_id IN (?)
+			) ranked_comments 
+			WHERE rn <= 3
+			ORDER BY post_id, created_at DESC
+		`
+		query, args, err = sqlx.In(commentQuery, postIDs)
+		if err != nil {
+			return nil, err
+		}
+		err = db.Select(&allCommentsList, query, args...)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Group comments by post_id and collect comment user IDs
-	// Also apply the allComments limit if needed
 	commentsMap := make(map[int][]Comment)
 	for _, c := range allCommentsList {
 		if !allComments && len(commentsMap[c.PostID]) >= 3 {
