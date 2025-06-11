@@ -298,6 +298,12 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 		session.Values["csrf_token"] = secureRandomStr(16)
 		session.Save(r, w)
 
+		if err != nil {
+            log.Printf("postLogin: FAILED to save session! Error: %v", err)
+            http.Error(w, "Failed to save session", http.StatusInternalServerError)
+            return // エラーが発生したらリダイレクトしない
+        }
+
 		http.Redirect(w, r, "/", http.StatusFound)
 	} else {
 		session := getSession(r)
