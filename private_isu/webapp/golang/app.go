@@ -245,9 +245,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	// Group comments by post_id and collect comment user IDs
 	commentsMap := make(map[int][]Comment)
 	for _, c := range allCommentsList {
-		if !allComments && len(commentsMap[c.PostID]) >= 3 {
-			continue // Skip if we already have 3 comments for this post
-		}
 		commentsMap[c.PostID] = append(commentsMap[c.PostID], c)
 		userIDs[c.UserID] = true
 	}
@@ -277,7 +274,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 					comments[i].User = user
 				}
 			}
-			// Reverse comments
+			// Comments are already in DESC order from SQL, but we need to reverse for display
+			// (original code expected oldest first for display)
 			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 				comments[i], comments[j] = comments[j], comments[i]
 			}
@@ -289,11 +287,12 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		// Set user
 		if user, ok := userMap[p.UserID]; ok {
 			p.User = user
-			p.CSRFToken = csrfToken
+		}
 
-			if p.User.DelFlg == 0 {
-				posts = append(posts, p)
-			}
+		p.CSRFToken = csrfToken
+
+		if p.User.DelFlg == 0 {
+			posts = append(posts, p)
 		}
 
 		if len(posts) >= postsPerPage {
