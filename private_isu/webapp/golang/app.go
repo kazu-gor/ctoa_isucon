@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -27,6 +28,14 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+	
+	// Image cache
+	imageCache     map[int][]byte
+	imageCacheMu   sync.RWMutex
+	
+	// User cache
+	userCache   map[int]User
+	userCacheMu sync.RWMutex
 )
 
 const (
@@ -74,6 +83,11 @@ func init() {
 	memcacheClient := memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	
+	// Initialize image cache
+	imageCache = make(map[int][]byte)
+	// Initialize user cache
+	userCache = make(map[int]User)
 }
 
 func dbInitialize() {
@@ -88,6 +102,16 @@ func dbInitialize() {
 	for _, sql := range sqls {
 		db.Exec(sql)
 	}
+	
+	// Clear image cache
+	imageCacheMu.Lock()
+	imageCache = make(map[int][]byte)
+	imageCacheMu.Unlock()
+	
+	// Clear user cache
+	userCacheMu.Lock()
+	userCache = make(map[int]User)
+	userCacheMu.Unlock()
 }
 
 func tryLogin(accountName, password string) *User {
@@ -148,12 +172,35 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
+	userID, ok := uid.(int64)
+	if !ok {
+		// Try int type
+		if id, ok := uid.(int); ok {
+			userID = int64(id)
+		} else {
+			return User{}
+		}
+	}
+	
+	// Check cache first
+	userCacheMu.RLock()
+	u, cached := userCache[int(userID)]
+	userCacheMu.RUnlock()
+	
+	if cached {
+		return u
+	}
 
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	// If not cached, fetch from database
+	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return User{}
 	}
+	
+	// Cache the user
+	userCacheMu.Lock()
+	userCache[int(userID)] = u
+	userCacheMu.Unlock()
 
 	return u
 }
@@ -172,48 +219,151 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
+
 	var posts []Post
 
+	// Collect all post IDs and user IDs
+	postIDs := make([]int, 0, len(results))
+	userIDs := make(map[int]struct{})
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		postIDs = append(postIDs, p.ID)
+		userIDs[p.UserID] = struct{}{}
+	}
+
+	// Batch fetch all users
+	userList := make([]int, 0, len(userIDs))
+	for userID := range userIDs {
+		userList = append(userList, userID)
+	}
+	
+	query, args, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userList)
+	if err != nil {
+		return nil, err
+	}
+	query = db.Rebind(query)
+	
+	var users []User
+	err = db.Select(&users, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	
+	userMap := make(map[int]User)
+	for _, u := range users {
+		userMap[u.ID] = u
+	}
+
+	// Batch fetch comment counts
+	type CommentCount struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	
+	query, args, err = sqlx.In("SELECT post_id, COUNT(*) as count FROM `comments` WHERE `post_id` IN (?) GROUP BY post_id", postIDs)
+	if err != nil {
+		return nil, err
+	}
+	query = db.Rebind(query)
+	
+	var commentCounts []CommentCount
+	err = db.Select(&commentCounts, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	
+	commentCountMap := make(map[int]int)
+	for _, cc := range commentCounts {
+		commentCountMap[cc.PostID] = cc.Count
+	}
+
+	// Batch fetch comments with users
+	commentQuery := `
+		SELECT c.*, u.* 
+		FROM comments c 
+		JOIN users u ON c.user_id = u.id 
+		WHERE c.post_id IN (?)
+		ORDER BY c.post_id, c.created_at DESC
+	`
+	
+	if !allComments {
+		// For limited comments, we need a more complex query
+		commentQuery = `
+			SELECT c.*, u.*
+			FROM (
+				SELECT c1.*
+				FROM comments c1
+				WHERE c1.post_id IN (?)
+				AND (
+					SELECT COUNT(*)
+					FROM comments c2
+					WHERE c2.post_id = c1.post_id
+					AND c2.created_at > c1.created_at
+				) < 3
+			) c
+			JOIN users u ON c.user_id = u.id
+			ORDER BY c.post_id, c.created_at DESC
+		`
+	}
+	
+	query, args, err = sqlx.In(commentQuery, postIDs)
+	if err != nil {
+		return nil, err
+	}
+	query = db.Rebind(query)
+	
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	// Map to store comments by post_id
+	commentsMap := make(map[int][]Comment)
+	
+	for rows.Next() {
+		var c Comment
+		var u User
+		err := rows.Scan(
+			&c.ID, &c.PostID, &c.UserID, &c.Comment, &c.CreatedAt,
+			&u.ID, &u.AccountName, &u.Passhash, &u.Authority, &u.DelFlg, &u.CreatedAt,
+		)
 		if err != nil {
 			return nil, err
 		}
+		c.User = u
+		commentsMap[c.PostID] = append(commentsMap[c.PostID], c)
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
+	// Build posts with all data
+	for _, p := range results {
+		user, ok := userMap[p.UserID]
+		if !ok || user.DelFlg != 0 {
+			continue
 		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+		
+		p.User = user
+		p.CommentCount = commentCountMap[p.ID]
+		
+		if comments, ok := commentsMap[p.ID]; ok {
+			// Limit to 3 comments if needed
+			if !allComments && len(comments) > 3 {
+				comments = comments[:3]
 			}
+			// Reverse comments to chronological order
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
+			p.Comments = comments
+		} else {
+			p.Comments = []Comment{}
 		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
+		
 		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		
+		posts = append(posts, p)
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -444,40 +594,25 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	// Get all stats in a single query
+	type UserStats struct {
+		CommentCount   int `db:"comment_count"`
+		PostCount      int `db:"post_count"`
+		CommentedCount int `db:"commented_count"`
+	}
+	
+	stats := UserStats{}
+	statsQuery := `
+		SELECT 
+			(SELECT COUNT(*) FROM comments WHERE user_id = ?) AS comment_count,
+			(SELECT COUNT(*) FROM posts WHERE user_id = ?) AS post_count,
+			(SELECT COUNT(*) FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)) AS commented_count
+	`
+	
+	err = db.Get(&stats, statsQuery, user.ID, user.ID, user.ID)
 	if err != nil {
 		log.Print(err)
 		return
-	}
-
-	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	postCount := len(postIDs)
-
-	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
-			log.Print(err)
-			return
-		}
 	}
 
 	me := getSessionUser(r)
@@ -498,7 +633,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	}{posts, user, stats.PostCount, stats.CommentCount, stats.CommentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -678,20 +813,48 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
-		log.Print(err)
-		return
+	// Check cache first
+	imageCacheMu.RLock()
+	imgdata, cached := imageCache[pid]
+	imageCacheMu.RUnlock()
+	
+	var mime string
+	
+	if !cached {
+		// If not cached, fetch from database
+		post := Post{}
+		err = db.Get(&post, "SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = ?", pid)
+		if err != nil {
+			log.Print(err)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		
+		mime = post.Mime
+		imgdata = post.Imgdata
+		
+		// Cache the image
+		imageCacheMu.Lock()
+		imageCache[pid] = imgdata
+		imageCacheMu.Unlock()
+	} else {
+		// Need to get mime type for cached image
+		err = db.Get(&mime, "SELECT `mime` FROM `posts` WHERE `id` = ?", pid)
+		if err != nil {
+			log.Print(err)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 	}
 
 	ext := r.PathValue("ext")
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+	if ext == "jpg" && mime == "image/jpeg" ||
+		ext == "png" && mime == "image/png" ||
+		ext == "gif" && mime == "image/gif" {
+		w.Header().Set("Content-Type", mime)
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		_, err := w.Write(imgdata)
 		if err != nil {
 			log.Print(err)
 			return
